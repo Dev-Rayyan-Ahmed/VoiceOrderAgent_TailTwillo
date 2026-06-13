@@ -1,17 +1,21 @@
 import os
 import sys
+import datetime
+import json
+import requests  
 from dotenv import load_dotenv
 from openai import OpenAI
 
 # 1. Load environment variables from a .env file
 load_dotenv()
 
-# 2. Retrieve your Groq API key
-# Make sure your .env file has: GROQ_API_KEY=gsk_...
+# 2. Retrieve environment variables
 api_key = os.getenv("MODEL_API_KEY")
+# Get your local n8n URL from .env, or default to localhost if not specified
+n8n_url = os.getenv("N8N_WEBHOOK_URL", "http://localhost:5678/webhook-test/restaurant-orders")
 
 if not api_key:
-    print("❌ Error: GROQ_API_KEY not found. Please check your .env file.")
+    print("❌ Error: MODEL_API_KEY not found. Please check your .env file.")
     sys.exit(1)
 
 print("🚀 Groq API Key loaded successfully. Connecting to GroqCloud...")
@@ -22,7 +26,6 @@ client = OpenAI(
     api_key=api_key,
 )
 
-# The EXACT Few-Shot System Prompt from your server code
 SYSTEM_PROMPT = """
 You are an AI order-taking agent for a restaurant. You speak ONLY English.
 
@@ -51,21 +54,18 @@ Customer: "Yes, confirm."
 Agent: {"status": "confirmed", "items": ["beef burger"]}
 """
 
-# Initialize history with the system prompt
 chat_history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
 print("=" * 60)
-print("🎙️ Groq Console Tester - Restaurant Voice Agent")
+print("🎙️ Groq Console Tester + n8n Push - Restaurant Voice Agent")
 print("Try ordering a burger, letting it upsell, then say 'confirm'.")
 print("Type 'quit' or 'exit' to close.")
 print("=" * 60 + "\n")
 
-# Start with the exact greeting the phone call uses
 initial_greeting = "Welcome to our restaurant! What would you like to order today?"
 print(f"🤖 Bot: {initial_greeting}")
 chat_history.append({"role": "assistant", "content": initial_greeting})
 
-# The testing loop
 while True:
     try:
         user_input = input("\n🧑 You: ")
@@ -78,22 +78,51 @@ while True:
             continue
 
         chat_history.append({"role": "user", "content": user_input})
-        
         print("🤖 Bot is thinking...", end="\r") 
 
         # 4. Call Groq's high-speed engine
         response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",  # Extreme low-latency model optimized for chat
+            model="llama-3.1-8b-instant",
             messages=chat_history,
             temperature=0.3
         )
         
         ai_response = response.choices[0].message.content.strip()
-        
-        # Clear line and print response
         print("\033[K🤖 Bot: " + ai_response)
         
         chat_history.append({"role": "assistant", "content": ai_response})
+
+        # --- NEW: Check if the AI returned a JSON order payload ---
+        if ai_response.startswith("{") and "confirmed" in ai_response.lower():
+            print("\n📦 Order detected! Compiling history for n8n...")
+            
+            # Reconstruct the entire clean dialog transcript to pass over
+            full_transcript = ""
+            for msg in chat_history:
+                if msg["role"] == "user":
+                    full_transcript += f"Customer: {msg['content']}\n"
+                elif msg["role"] == "assistant" and not msg["content"].startswith("{"):
+                    full_transcript += f"Agent: {msg['content']}\n"
+            
+            # Format the exact JSON payload n8n expects
+            payload = {
+                "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "phone_number": "+1234567890 (Console-Test)", 
+                "call_sid": "CONSOLE_" + datetime.datetime.now().strftime("%Y%m%d%H%M%S"),
+                "transcript": full_transcript.strip()
+            }
+            
+            # Send the payload via HTTP POST directly to n8n
+            try:
+                print(f"📤 Pushing order payload to n8n webhook...")
+                n8n_response = requests.post(n8n_url, json=payload)
+                if n8n_response.status_code in [200, 201]:
+                    print("✅ Successfully logged to n8n! Check your Google Sheet.")
+                else:
+                    print(f"⚠️ n8n responded with status code: {n8n_response.status_code}")
+            except Exception as webhook_error:
+                print(f"❌ Could not connect to n8n webhook: {webhook_error}")
+                print("Make sure n8n is running locally (`npx n8n`) and the URL is right.")
 
     except KeyboardInterrupt:
         print("\nExiting...")
